@@ -1,0 +1,16 @@
+# Environment and secrets
+.env
+
+# Virtual environment and wheels
+.venv/
+venv/
+wheels/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Temporary runtime files
+temp_jarvis_speech.mp3
+screenshot.png
+jarvis_notes.txt

@@ -1,10 +1,16 @@
 import pyttsx3
 import speech_recognition as sr
+import asyncio
+import edge_tts
+import pygame
 import datetime
 import os
 import cv2
 import random
-from requests import get
+import re
+import threading
+import json
+from requests import get, post
 import wikipedia
 import time
 import webbrowser
@@ -24,17 +30,191 @@ import sympy
 import pywikihow
 from pywikihow import search_wikihow
 
-# SAFE SPEAK FUNCTION 
-def speak(text):
-    engine = pyttsx3.init("sapi5")   # re-init EVERY time (important)
-    voices = engine.getProperty('voices')
-    engine.setProperty('voice', voices[0].id)
-    engine.setProperty('rate', 175)
+# Load API key from .env file
+def get_gemini_api_key():
+    paths = [
+        os.path.join(os.path.dirname(__file__), ".env"),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+    ]
+    for env_file in paths:
+        if os.path.exists(env_file):
+            with open(env_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("GEMINI_API_KEY"):
+                        return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return os.environ.get("GEMINI_API_KEY", "")
 
-    engine.say(text)
-    engine.runAndWait()
-    engine.stop()
-    print(f"Jarvis: {text}")  # Print what Jarvis speaks
+# Chat memory
+conversation_history = []
+def ask_gemini(user_prompt):
+    api_key = get_gemini_api_key()
+    if not api_key:
+        return "Sir, please add your Gemini API key in the dot env file to activate my AI brain."
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    
+    # Keep history to last 6 messages (context memory)
+    global conversation_history
+    if len(conversation_history) > 6:
+        conversation_history = conversation_history[-6:]
+        
+    conversation_history.append({"role": "user", "parts": [{"text": user_prompt}]})
+    payload = {
+        "system_instruction": {
+            "parts": [{
+                "text": (
+                    "You are J.A.R.V.I.S., Tony Stark's sophisticated, polite, and loyal AI assistant. "
+                    "Keep your responses concise (1 to 3 sentences maximum), natural, and clear. "
+                    "Never use asterisks, markdown, bullets, or emojis because your answer will be read aloud by text-to-speech."
+                )
+            }]
+        },
+        "contents": conversation_history
+    }
+    try:
+        response = post(url, json=payload, timeout=10)
+        data = response.json()
+        
+        if "candidates" in data and len(data["candidates"]) > 0:
+            reply = data["candidates"][0]["content"]["parts"][0]["text"]
+            # Clean any remaining markdown formatting
+            reply = re.sub(r'[*_#`]', '', reply).strip()
+            
+            conversation_history.append({"role": "model", "parts": [{"text": reply}]})
+            return reply
+        else:
+            return "Sir, I encountered an issue processing that query."
+    except Exception as e:
+        print("Gemini API Error:", e)
+        return "I am having trouble connecting to my neural network at the moment."
+
+# ==========================================
+# GEMINI VISION & SCREEN MULTIMODAL AI
+# ==========================================
+def ask_gemini_vision(prompt, image_b64, mime_type="image/jpeg"):
+    api_key = get_gemini_api_key()
+    if not api_key:
+        return "Sir, please configure your Gemini API key in the dot env file to enable visual analysis."
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+
+    payload = {
+        "system_instruction": {
+            "parts": [{
+                "text": (
+                    "You are J.A.R.V.I.S., Tony Stark's sophisticated AI assistant. "
+                    "Analyze the provided image and reply with a concise, intelligent, and natural description "
+                    "(1 to 2 sentences max) suitable to be spoken aloud. Never use asterisks, markdown, or bullet points."
+                )
+            }]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": image_b64
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+    try:
+        response = post(url, json=payload, timeout=15)
+        data = response.json()
+        if "candidates" in data and len(data["candidates"]) > 0:
+            reply = data["candidates"][0]["content"]["parts"][0]["text"]
+            reply = re.sub(r'[*_#`]', '', reply).strip()
+            return reply
+        else:
+            return "Sir, I could not extract clear visual data from that image."
+    except Exception as e:
+        print("Gemini Vision Error:", e)
+        return "Visual sensor processing encountered an anomaly, sir."
+
+def capture_webcam():
+    try:
+        import base64
+        cap = cv2.VideoCapture(0)
+        time.sleep(0.2)
+        ret, frame = cap.read()
+        cap.release()
+        if ret:
+            _, buffer = cv2.imencode('.jpg', frame)
+            return base64.b64encode(buffer).decode('utf-8')
+    except Exception as e:
+        print("Webcam capture error:", e)
+    return None
+
+def capture_screen():
+    try:
+        from PIL import ImageGrab
+        import io, base64
+        shot = ImageGrab.grab()
+        buf = io.BytesIO()
+        shot.thumbnail((1280, 720))
+        shot.save(buf, format='JPEG', quality=85)
+        return base64.b64encode(buf.getvalue()).decode('utf-8')
+    except Exception as e:
+        print("Screen grab error:", e)
+    return None
+
+# Initialize pygame mixer and select Jarvis voice
+pygame.mixer.init()
+JARVIS_VOICE = "en-GB-RyanNeural"
+
+# Iron Man HUD Sound Effects
+ACTIVATE_SOUND = os.path.join(os.path.dirname(__file__), "jarvis_activate.wav")
+CONFIRM_SOUND = os.path.join(os.path.dirname(__file__), "jarvis_confirm.wav")
+
+def play_hud_sound(sound_type="activate"):
+    try:
+        path = ACTIVATE_SOUND if sound_type == "activate" else CONFIRM_SOUND
+        if os.path.exists(path):
+            sound = pygame.mixer.Sound(path)
+            sound.set_volume(0.4)
+            sound.play()
+    except Exception:
+        pass
+
+# SAFE SPEAK FUNCTION 
+async def _edge_speak_async(text, output_path):
+    # -4Hz pitch and -3% rate matches Paul Bettany's calm, deep cinematic cadence
+    communicate = edge_tts.Communicate(text, JARVIS_VOICE, pitch="-4Hz", rate="-3%")
+    await communicate.save(output_path)
+
+def speak(text):
+    print(f"Jarvis: {text}")
+    audio_path = os.path.join(os.path.dirname(__file__), "temp_jarvis_speech.mp3")
+    try:
+        # Generate neural AI voice
+        asyncio.run(_edge_speak_async(text, audio_path))
+        
+        # Play audio
+        pygame.mixer.music.load(audio_path)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            pygame.time.Clock().tick(10)
+            
+        pygame.mixer.music.unload()
+        if os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+            except Exception:
+                pass
+    except Exception as e:
+        # Automatic fallback to pyttsx3 if offline
+        print("Edge-TTS error (using pyttsx3 fallback):", e)
+        engine = pyttsx3.init("sapi5")
+        engine.setProperty('rate', 175)
+        engine.say(text)
+        engine.runAndWait()
+        engine.stop()
+
 
 # SPEAK LONG TEXT (Wikipedia fix)
 def speak_long_text(text):
@@ -89,6 +269,193 @@ def get_location():
         print("Unable to get location")
         return None, None, None
 
+# ==========================================
+# TASK 3: PC SYSTEM CONTROLS (VOLUME, BRIGHTNESS, HARDWARE)
+# ==========================================
+def set_volume(percent):
+    try:
+        from pycaw.pycaw import AudioUtilities
+        speakers = AudioUtilities.GetSpeakers()
+        speakers.EndpointVolume.SetMasterVolumeLevelScalar(max(0.0, min(1.0, percent / 100.0)), None)
+        speak(f"Volume set to {percent} percent")
+    except Exception as e:
+        speak("Sorry sir, I could not adjust the volume.")
+        print("Volume Error:", e)
+
+def change_volume(delta):
+    try:
+        from pycaw.pycaw import AudioUtilities
+        speakers = AudioUtilities.GetSpeakers()
+        curr = speakers.EndpointVolume.GetMasterVolumeLevelScalar()
+        new_vol = max(0.0, min(1.0, curr + (delta / 100.0)))
+        speakers.EndpointVolume.SetMasterVolumeLevelScalar(new_vol, None)
+        speak(f"Volume {'increased' if delta > 0 else 'decreased'}")
+    except Exception as e:
+        speak("Sorry sir, could not adjust the volume.")
+
+def mute_volume(mute=True):
+    try:
+        from pycaw.pycaw import AudioUtilities
+        speakers = AudioUtilities.GetSpeakers()
+        speakers.EndpointVolume.SetMute(1 if mute else 0, None)
+        speak("Audio muted" if mute else "Audio unmuted")
+    except Exception as e:
+        speak("Sorry sir, could not mute audio.")
+
+def set_brightness(percent):
+    try:
+        import screen_brightness_control as sbc
+        sbc.set_brightness(percent)
+        speak(f"Brightness set to {percent} percent")
+    except Exception as e:
+        speak("Sorry sir, I could not adjust screen brightness.")
+        print("Brightness Error:", e)
+
+def change_brightness(delta):
+    try:
+        import screen_brightness_control as sbc
+        curr = sbc.get_brightness()[0]
+        new_b = max(10, min(100, curr + delta))
+        sbc.set_brightness(new_b)
+        speak(f"Brightness adjusted to {new_b} percent")
+    except Exception as e:
+        speak("Sorry sir, could not adjust brightness.")
+
+def get_system_stats():
+    try:
+        import psutil
+        cpu = psutil.cpu_percent(interval=0.5)
+        ram = psutil.virtual_memory().percent
+        battery = psutil.sensors_battery()
+        msg = f"CPU load is at {int(cpu)} percent. RAM usage is at {int(ram)} percent."
+        if battery:
+            state = "plugged in" if battery.power_plugged else "on battery power"
+            msg += f" Battery is at {battery.percent} percent and is {state}."
+        speak(msg)
+    except Exception as e:
+        speak("Sorry sir, could not retrieve hardware diagnostics.")
+        print("Stats Error:", e)
+
+# ==========================================
+# TASK 5: PRODUCTIVITY (WEATHER, NOTES, TIMERS, CONTACTS)
+# ==========================================
+def get_weather(city=""):
+    try:
+        url = f"https://wttr.in/{city}?format=%l:+%C,+%t" if city else "https://wttr.in/?format=%l:+%C,+%t"
+        res = get(url, timeout=5).text.strip()
+        clean_res = res.replace("°C", " degrees Celsius").replace("+", "")
+        speak(f"Current weather: {clean_res}")
+        print(f"Weather: {clean_res}")
+    except Exception as e:
+        speak("Sorry sir, I could not fetch the weather report.")
+        print("Weather Error:", e)
+
+NOTES_FILE = os.path.join(os.path.dirname(__file__), "jarvis_notes.txt")
+
+def take_note(note_text):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    with open(NOTES_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {note_text}\n")
+    speak("Note saved successfully, sir.")
+
+def read_notes():
+    if os.path.exists(NOTES_FILE):
+        with open(NOTES_FILE, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f.readlines() if l.strip()]
+        if lines:
+            speak("Here are your recent notes:")
+            for line in lines[-5:]:
+                speak(line)
+        else:
+            speak("You have no saved notes, sir.")
+    else:
+        speak("You have no saved notes, sir.")
+
+def set_timer(seconds, label="timer"):
+    def timer_worker():
+        time.sleep(seconds)
+        play_hud_sound("activate")
+        speak(f"Sir! Your {label} for {seconds} seconds has finished!")
+    t = threading.Thread(target=timer_worker, daemon=True)
+    t.start()
+    speak(f"Timer set for {seconds} seconds, sir.")
+
+def get_contact(name):
+    contacts_path = os.path.join(os.path.dirname(__file__), "contacts.json")
+    if os.path.exists(contacts_path):
+        with open(contacts_path, "r", encoding="utf-8") as f:
+            contacts = json.load(f)
+            return contacts.get(name.lower(), None)
+    return None
+
+# ==========================================
+# UNIVERSAL APPLICATION LAUNCHER
+# ==========================================
+COMMON_APPS = {
+    "chrome": "chrome",
+    "google chrome": "chrome",
+    "browser": "chrome",
+    "edge": "msedge",
+    "microsoft edge": "msedge",
+    "firefox": "firefox",
+    "code": "code",
+    "vs code": "code",
+    "visual studio code": "code",
+    "notepad": "notepad",
+    "calculator": "calc",
+    "calc": "calc",
+    "spotify": "spotify",
+    "command prompt": "cmd",
+    "cmd": "cmd",
+    "terminal": "wt",
+    "powershell": "powershell",
+    "paint": "mspaint",
+    "file explorer": "explorer",
+    "files": "explorer",
+    "explorer": "explorer",
+    "task manager": "taskmgr",
+    "settings": "start ms-settings:",
+    "word": "winword",
+    "excel": "excel",
+    "powerpoint": "powerpnt",
+    "whatsapp": "whatsapp",
+}
+
+def open_app(app_name):
+    app_clean = app_name.lower().strip()
+    cmd = COMMON_APPS.get(app_clean, None)
+
+    if cmd:
+        if cmd.startswith("start "):
+            os.system(cmd)
+        else:
+            os.system(f'start "" "{cmd}"')
+        speak(f"Opening {app_name}, sir.")
+        return True
+
+    # Try launching directly via Windows Start
+    try:
+        res = os.system(f'start "" "{app_clean}"')
+        if res == 0:
+            speak(f"Opening {app_name}, sir.")
+            return True
+    except Exception:
+        pass
+
+    # Fallback: Type in Windows Search
+    try:
+        pyautogui.press('win')
+        time.sleep(0.3)
+        pyautogui.write(app_name, interval=0.03)
+        time.sleep(0.4)
+        pyautogui.press('enter')
+        speak(f"Searching and opening {app_name}, sir.")
+        return True
+    except Exception as e:
+        speak(f"Sorry sir, could not find application {app_name}.")
+        print("Open App Error:", e)
+        return False
+
 # INSTAGRAM PROFILE DOWNLOADER
 from instaloader import Instaloader, Profile
 
@@ -106,6 +473,7 @@ def download_instagram_profile_pic(username):
 
 #  SPEECH TO TEXT 
 def takeCommand():
+    play_hud_sound("activate")
     r = sr.Recognizer()
     with sr.Microphone() as source:
         print("Listening...")
@@ -116,6 +484,7 @@ def takeCommand():
         print("Recognizing...")
         query = r.recognize_google(audio, language='en-in')
         print("User said:", query)
+        play_hud_sound("confirm")
         return query.lower()
     except Exception:
         speak("Say that again please")
@@ -183,22 +552,160 @@ def run_jarvis(callback=None):
     wish()
     while True:
         query = takeCommand()
+        if not query:
+            continue
+            
         if callback:
             callback("USER: " + query)
+            
+        # ==========================================
+        # TASK 4: WAKE WORD DETECTION ("Jarvis" / "Hey Jarvis")
+        # ==========================================
+        if query in ["jarvis", "hey jarvis"]:
+            play_hud_sound("confirm")
+            speak("At your service, sir. What can I do for you?")
+            continue
+        elif query.startswith("jarvis "):
+            query = query[7:].strip()
+        elif query.startswith("hey jarvis "):
+            query = query[11:].strip()
         
-        #  OPEN NOTEPAD FUNCTION
+        # ==========================================
+        # IN-APP ACTIONS (PERFORM TASKS ON ACTIVE APP)
+        # ==========================================
+        if query.startswith("type ") or query.startswith("write "):
+            text_to_type = query.split(" ", 1)[1]
+            speak("Typing now, sir.")
+            time.sleep(0.5)
+            pyautogui.write(text_to_type + " ", interval=0.03)
 
-        if "open notepad" in query:
-            os.startfile("C:\\Windows\\System32\\notepad.exe")
-            print("Opening Notepad")
+        elif "press enter" in query or "hit enter" in query:
+            pyautogui.press("enter")
 
-        #  OPEN COMMAND PROMPT FUNCTION
+        elif "press backspace" in query or "delete that" in query:
+            pyautogui.press("backspace")
 
-        elif "open command prompt" in query:
-            os.startfile("C:\\Windows\\System32\\cmd.exe")
-            print("Opening Command Prompt")
+        elif "select all" in query:
+            pyautogui.hotkey("ctrl", "a")
 
-        #  OPEN CAMERA FUNCTION
+        elif "copy that" in query or "copy this" in query:
+            pyautogui.hotkey("ctrl", "c")
+            speak("Copied to clipboard, sir.")
+
+        elif "paste that" in query or "paste here" in query or "paste" in query:
+            pyautogui.hotkey("ctrl", "v")
+
+        elif "undo that" in query or "undo" in query:
+            pyautogui.hotkey("ctrl", "z")
+
+        elif "save file" in query or "save this" in query:
+            pyautogui.hotkey("ctrl", "s")
+            speak("File saved, sir.")
+
+        # In-App Scrolling & Tab Navigation
+        elif "scroll down" in query:
+            pyautogui.scroll(-600)
+
+        elif "scroll up" in query:
+            pyautogui.scroll(600)
+
+        elif "new tab" in query:
+            pyautogui.hotkey("ctrl", "t")
+
+        elif "close tab" in query:
+            pyautogui.hotkey("ctrl", "w")
+
+        elif "reload" in query or "refresh page" in query:
+            pyautogui.hotkey("ctrl", "r")
+
+        elif "zoom in" in query:
+            pyautogui.hotkey("ctrl", "+")
+
+        elif "zoom out" in query:
+            pyautogui.hotkey("ctrl", "-")
+
+        # Window Sizing & Control
+        elif "maximize" in query or "maximize window" in query:
+            pyautogui.hotkey("win", "up")
+
+        elif "minimize" in query or "minimize window" in query:
+            pyautogui.hotkey("win", "down")
+
+        elif "close this window" in query or "close this app" in query or "close window" in query:
+            pyautogui.hotkey("alt", "f4")
+            speak("Window closed, sir.")
+
+        elif "pause video" in query or "play video" in query:
+            pyautogui.press("space")
+
+        # ==========================================
+        # ADVANCED MEDIA CONTROLS
+        # ==========================================
+        elif "next track" in query or "next song" in query or "skip track" in query:
+            pyautogui.press("nexttrack")
+            speak("Skipping to next track, sir.")
+
+        elif "previous track" in query or "previous song" in query or "last song" in query:
+            pyautogui.press("prevtrack")
+            speak("Playing previous track, sir.")
+
+        elif "stop music" in query or "stop audio" in query:
+            pyautogui.press("stop")
+            speak("Audio stopped, sir.")
+
+        # ==========================================
+        # VISION AI & SCREEN READING (WEBCAM & SCREEN)
+        # ==========================================
+        elif "look at this" in query or "what am i holding" in query or "what do you see" in query or "scan this" in query:
+            speak("Scanning optical feed now, sir...")
+            b64 = capture_webcam()
+            if b64:
+                analysis = ask_gemini_vision("Describe what the user is holding or what is in front of the camera.", b64)
+                speak(analysis)
+            else:
+                speak("Optical camera sensor is unavailable, sir.")
+
+        elif "summarize screen" in query or "summarize my screen" in query or "what is on my screen" in query or "read my screen" in query:
+            speak("Scanning display contents, sir...")
+            b64 = capture_screen()
+            if b64:
+                analysis = ask_gemini_vision("Summarize the main content, window, or document shown on this computer screen in 2 clear sentences.", b64)
+                speak(analysis)
+            else:
+                speak("Display sensor unavailable, sir.")
+
+        elif "explain this error" in query or "diagnose error" in query or "debug this" in query:
+            speak("Diagnosing screen error, sir...")
+            b64 = capture_screen()
+            if b64:
+                analysis = ask_gemini_vision("Identify and diagnose the programming error, bug, or issue shown on this screen, and explain the solution in 2 clear sentences.", b64)
+                speak(analysis)
+            else:
+                speak("Could not capture display, sir.")
+
+        # ==========================================
+        # AUTONOMOUS AGENT ACTIONS
+        # ==========================================
+        elif "search youtube for" in query:
+            topic = query.replace("search youtube for", "").replace("and play", "").strip()
+            speak(f"Searching YouTube for {topic}, sir.")
+            webbrowser.open(f"https://www.youtube.com/results?search_query={topic}")
+
+        elif ("open notepad and write" in query) or ("open word and write" in query):
+            target_app = "notepad" if "notepad" in query else "word"
+            text_body = query.split("write", 1)[1].strip()
+            open_app(target_app)
+            time.sleep(1.0)
+            pyautogui.write(text_body + " ", interval=0.03)
+            speak("I have opened the editor and written your text, sir.")
+
+        elif "lock pc" in query or "lock my pc" in query or "lock computer" in query:
+            speak("Locking workstation immediately, sir.")
+            os.system("rundll32.exe user32.dll,LockWorkStation")
+
+        # ==========================================
+        # UNIVERSAL APP LAUNCHER ("open <any app>")
+        # ==========================================
         elif "open camera" in query:
             cap = cv2.VideoCapture(0)
             while True:
@@ -209,6 +716,20 @@ def run_jarvis(callback=None):
             cap.release()
             cv2.destroyAllWindows()
             print("Camera opened")
+
+        elif query.startswith("open "):
+            target_app = query[5:].strip()
+            if target_app == "youtube":
+                webbrowser.open("www.youtube.com")
+            elif target_app == "google":
+                speak("Sir, what should I search on Google?")
+                q = takeCommand()
+                if q:
+                    webbrowser.open("https://www.google.com/search?q=" + q)
+            elif target_app == "stackoverflow":
+                webbrowser.open("www.stackoverflow.com")
+            else:
+                open_app(target_app)
 
         #  PLAY MUSIC FUNCTION
 
@@ -264,15 +785,26 @@ def run_jarvis(callback=None):
             print("Opening StackOverflow")
 
         #  WHATSAPP MESSAGE FUNCTION
+        elif "send message" in query or "send whatsapp" in query or "whatsapp" in query:
+            speak("Who would you like to message, sir?")
+            recipient = takeCommand()
+            contact = get_contact(recipient)
+            phone = contact["phone"] if contact else None
 
-        elif "send messaage" in query:
-            pywhatkit.sendwhatmsg(
-                "+919892976105",
-                "Hello from Python",
-                11,
-                40
-            )
-            print("WhatsApp message scheduled")
+            if not phone:
+                speak(f"Contact {recipient} not found. Please enter phone number in the terminal.")
+                phone = input("Enter phone number with country code (e.g. +91...): ")
+
+            speak("What is the message, sir?")
+            msg_text = takeCommand()
+            if msg_text:
+                speak(f"Sending WhatsApp message to {recipient or phone} now, sir.")
+                try:
+                    pywhatkit.sendwhatmsg_instantly(phone, msg_text, 15, True, 3)
+                    print(f"WhatsApp sent to {phone}: {msg_text}")
+                except Exception as e:
+                    speak("Could not send WhatsApp message.")
+                    print("WhatsApp Error:", e)
 
         #  YOUTUBE SONG FUNCTION
 
@@ -284,55 +816,35 @@ def run_jarvis(callback=None):
 
         #  EMAIL FUNCTION
 
-        elif "email to kevin" in query:
-            speak("Sir, what should I say?")
-            content = takeCommand()
-            if "send a file" in content:
-                email = 'your@gmail.com'
-                password = 'your-password'
-                send_to_email = 'person@gmail.com'
-                speak("ok sir, What is the subject of the email?")
-                subject = takeCommand()
-                speak("And sir, what is the message of the email?")
-                message = takeCommand()
-                speak("Sir, please enter the file path of the document.")
-                file_location = input("Enter the file path here: ")
+        elif "email" in query or "send email" in query:
+            speak("Who should I send the email to, sir?")
+            recipient_name = takeCommand()
+            contact = get_contact(recipient_name)
+            send_to_email = contact["email"] if contact else None
 
-                speak("please wait sir, I am sending email now")
-                msg = MIMEMultipart()
-                msg['From'] = email
-                msg['To'] = send_to_email
-                msg['Subject'] = subject
-                msg.attach(MIMEText(message, 'plain'))
+            if not send_to_email:
+                speak(f"Contact {recipient_name} not found. Please enter the email address.")
+                send_to_email = input("Enter recipient email address: ")
 
-                filename = os.path.basename(file_location)
-                attachment = open(file_location, "rb")
-                part = MIMEBase('application', 'octet-stream')
-                part.set_payload((attachment).read())
-                encoders.encode_base64(part)
-                part.add_header('Content-Disposition', f"attachment; filename= {filename}")
-                msg.attach(part)
+            speak("What is the subject of the email?")
+            subject = takeCommand()
+            speak("What is the message, sir?")
+            message = takeCommand()
 
+            sender_email = os.environ.get("EMAIL_USER", "kevinsadguru@gmail.com")
+            sender_pass = os.environ.get("EMAIL_PASSWORD", "mabf wkar aikz tgib")
+
+            try:
                 server = st.SMTP('smtp.gmail.com', 587)
                 server.starttls()
-                server.login(email, password)
-                server.sendmail(email, send_to_email, msg.as_string())
+                server.login(sender_email, sender_pass)
+                server.sendmail(sender_email, send_to_email, f"Subject: {subject}\n\n{message}")
                 server.quit()
-                speak("Email has been sent to Kevin")
-                print(f"Email with attachment sent to {send_to_email}")
-            else:
-                email = 'your@gmail.com'
-                password = 'your-password'
-                send_to_email = 'person@gmail.com'
-                message = content
-
-                server = st.SMTP('smtp.gmail.com', 587)
-                server.starttls()
-                server.login(email, password)
-                server.sendmail(email, send_to_email, message)
-                server.quit()
-                speak("Email has been sent to Kevin")
+                speak(f"Email has been sent to {recipient_name or send_to_email}")
                 print(f"Email sent to {send_to_email}")
+            except Exception as e:
+                speak("Sorry sir, I could not send the email.")
+                print("Email Error:", e)
 
         #  CLOSE APPLICATIONS FUNCTION
 
@@ -499,6 +1011,72 @@ def run_jarvis(callback=None):
             speak("Goodbye Sir. Have a nice day.")
             print("Exiting Jarvis")
             sys.exit()
+
+        # ==========================================
+        # TASK 3: PC SYSTEM CONTROLS
+        # ==========================================
+        elif "mute" in query:
+            mute_volume(True)
+        elif "unmute" in query:
+            mute_volume(False)
+        elif "volume up" in query or "increase volume" in query:
+            change_volume(15)
+        elif "volume down" in query or "decrease volume" in query:
+            change_volume(-15)
+        elif "set volume to" in query:
+            nums = re.findall(r'\d+', query)
+            if nums:
+                set_volume(int(nums[0]))
+            else:
+                speak("Please specify a percentage, sir.")
+
+        elif "set brightness to" in query or "brightness to" in query:
+            nums = re.findall(r'\d+', query)
+            if nums:
+                set_brightness(int(nums[0]))
+            else:
+                speak("Please specify a brightness percentage, sir.")
+        elif "increase brightness" in query or "more brightness" in query:
+            change_brightness(20)
+        elif "decrease brightness" in query or "lower brightness" in query:
+            change_brightness(-20)
+
+        elif "system status" in query or "hardware status" in query or "battery" in query or "cpu" in query:
+            get_system_stats()
+
+        # ==========================================
+        # TASK 5: WEATHER, NOTES & TIMERS
+        # ==========================================
+        elif "weather" in query or "temperature" in query:
+            if " in " in query:
+                city = query.split(" in ")[-1].strip()
+                get_weather(city)
+            else:
+                get_weather()
+
+        elif "take a note" in query or "write this down" in query or "make a note" in query:
+            speak("What would you like me to write down, sir?")
+            note = takeCommand()
+            if note:
+                take_note(note)
+        elif "read notes" in query or "show notes" in query or "my notes" in query:
+            read_notes()
+
+        elif "set a timer for" in query or "timer for" in query:
+            nums = re.findall(r'\d+', query)
+            if nums:
+                val = int(nums[0])
+                if "minute" in query:
+                    set_timer(val * 60, f"{val} minute timer")
+                else:
+                    set_timer(val, f"{val} second timer")
+            else:
+                speak("Please specify how many minutes or seconds for the timer, sir.")
+
+        elif query != "":
+            print(f"Routing to Gemini AI: {query}")
+            reply = ask_gemini(query)
+            speak(reply)
 
         speak("Sir, do you have any other work for me?")
 
